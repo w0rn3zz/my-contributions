@@ -1,0 +1,27 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck and unused.
+  default: standard
+  settings:
+    errcheck:
+      # Calls with best-effort semantics explicitly assign their error to `_`.
+      # Implicitly discarded errors remain reportable.
+      check-type-assertions: false
+      check-blank: false
+  enable:
+    # Additional low-noise checks suitable for the current Go backend.
+    - gocritic
+    - misspell
+    - unconvert
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  # Show every distinct problem instead of hiding repeated occurrences.
+  max-same-issues: 0

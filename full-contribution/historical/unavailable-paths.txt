@@ -1,0 +1,10 @@
+backend/db_utils/db_utils.go
+backend/models/chat.go
+backend/models/chat_session.go
+backend/models/user.go
+backend/repositories/chat_repository.go
+backend/repositories/chat_session_repository.go
+backend/repositories/user_repository.go
+backend/services/chat_service.go
+backend/services/db.go
+backend/services/user_service.go
