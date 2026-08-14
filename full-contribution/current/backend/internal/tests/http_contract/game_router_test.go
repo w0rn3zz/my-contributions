@@ -8,13 +8,11 @@ import (
 	attemptsservice "anti-scam-trainer/backend/internal/features/attempts/service"
 	attemptshttp "anti-scam-trainer/backend/internal/features/attempts/transport/http"
 	authservice "anti-scam-trainer/backend/internal/features/auth/service"
-	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -156,7 +154,106 @@ func TestHTTPAIRateLimitRejectsBeforeProviderAndStateMutation(t *testing.T) {
 	}
 }
 
-func TestHTTPAllowsOnlyOneAIRequestInFlightPerUser(t *testing.T) {
+func TestHTTPMicroQuestionAnswerIsOptionalAndDoesNotChangeResult(t *testing.T) {
+	store := newHTTPGameStore()
+	store.attempts[1] = domain.Attempt{ID: 1, UserID: 1, Status: domain.AttemptStatusCompleted}
+	store.result = domain.AttemptResult{AttemptID: 1, Score: 75, Stars: 2, MicroQuestion: &domain.MicroQuestion{PatternCode: "phishing", Question: "Безопасное действие?", Options: []string{"Проверить", "Выполнить"}, Correct: 0}}
+	game := attemptsservice.NewGame(store)
+	handler := router.New()
+	handler.Register(router.V1, attemptshttp.New(game).Routes())
+	call := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/attempts/1/micro-question/answer", strings.NewReader(body))
+		request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: 1}))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+	if missing := call(`{}`); missing.Code != http.StatusConflict {
+		t.Fatalf("missing answer = (%d,%s)", missing.Code, missing.Body.String())
+	}
+	before := store.result
+	answered := call(`{"answer_index":0}`)
+	if answered.Code != http.StatusOK || !strings.Contains(answered.Body.String(), `"correct":true`) || !reflect.DeepEqual(store.result, before) {
+		t.Fatalf("answer = (%d,%s), result=%#v", answered.Code, answered.Body.String(), store.result)
+	}
+}
+
+func TestHTTPCompletedAttemptsDrivePatternThresholdAndSafeDecay(t *testing.T) {
+	store := newHTTPGameStore()
+	complete := func(safe bool) (*router.Router, string) {
+		game := attemptsservice.NewGameWithDependencies(store, profileContractAI{safe: safe}, profileContractAI{safe: safe}, func() bool { return true })
+		handler := router.New()
+		handler.Register(router.V1, attemptshttp.New(game).Routes())
+		start := httptest.NewRequest(http.MethodPost, "/api/v1/training/free-play/start?role=buyer", nil)
+		start = start.WithContext(authservice.WithIdentity(start.Context(), authservice.Identity{UserID: 1}))
+		startRecorder := httptest.NewRecorder()
+		handler.ServeHTTP(startRecorder, start)
+		if startRecorder.Code != http.StatusOK {
+			t.Fatalf("start = (%d,%s)", startRecorder.Code, startRecorder.Body.String())
+		}
+		body := ""
+		for turn := 1; turn <= 3; turn++ {
+			finish := ""
+			if turn == 3 {
+				finish = `,"finish":true`
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/attempts/1/answers", strings.NewReader(`{"step_id":`+strconv.Itoa(turn)+`,"free_text":"ответ"`+finish+`}`))
+			request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: 1}))
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("turn %d = (%d,%s)", turn, recorder.Code, recorder.Body.String())
+			}
+			body = recorder.Body.String()
+		}
+		return handler, body
+	}
+
+	_, first := complete(false)
+	if strings.Contains(first, `"micro_question"`) {
+		t.Fatalf("one risky completion must not create a stable pattern: %s", first)
+	}
+	secondHandler, second := complete(false)
+	if !strings.Contains(second, `"micro_question"`) || !strings.Contains(second, "social_engineering") {
+		t.Fatalf("second risky completion must expose the pattern question: %s", second)
+	}
+	beforeResult := store.result
+	beforeAttempt := store.attempts[1]
+	beforeAnswers, beforeMessages := len(store.answers), len(store.messages)
+	beforeQuiz, beforeStreak, beforeLevels := store.quizBest, store.streak, append([]domain.Level(nil), store.levels...)
+	answer := httptest.NewRequest(http.MethodPost, "/api/v1/attempts/1/micro-question/answer", strings.NewReader(`{"answer_index":0}`))
+	answer = answer.WithContext(authservice.WithIdentity(answer.Context(), authservice.Identity{UserID: 1}))
+	answerRecorder := httptest.NewRecorder()
+	secondHandler.ServeHTTP(answerRecorder, answer)
+	if answerRecorder.Code != http.StatusOK || !reflect.DeepEqual(store.result, beforeResult) || !reflect.DeepEqual(store.attempts[1], beforeAttempt) || len(store.answers) != beforeAnswers || len(store.messages) != beforeMessages || store.quizBest != beforeQuiz || !reflect.DeepEqual(store.streak, beforeStreak) || !reflect.DeepEqual(store.levels, beforeLevels) {
+		t.Fatalf("micro answer changed progression: code=%d body=%s", answerRecorder.Code, answerRecorder.Body.String())
+	}
+
+	_, third := complete(true)
+	if !strings.Contains(third, `"micro_question"`) {
+		t.Fatalf("one safe completion must reduce but not yet clear priority: %s", third)
+	}
+	_, fourth := complete(true)
+	if strings.Contains(fourth, `"micro_question"`) {
+		t.Fatalf("two safe completions must clear the stable pattern: %s", fourth)
+	}
+}
+
+func TestHTTPAIMetricsExposeOnlyAggregates(t *testing.T) {
+	store := newHTTPGameStore()
+	game := attemptsservice.NewGameWithAI(store, contractAI{}, contractAI{})
+	handler := router.New()
+	handler.Register(router.V1, attemptshttp.New(game).Routes())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/ai/metrics", nil)
+	request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: 1}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"evaluator"`) || strings.Contains(recorder.Body.String(), "policy") {
+		t.Fatalf("metrics = (%d,%s)", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHTTPBoundsSharedProviderConcurrencyAcrossUsers(t *testing.T) {
 	store := newHTTPGameStore()
 	provider := &blockingContractAI{started: make(chan struct{}), release: make(chan struct{})}
 	limit := ratelimit.New(ratelimit.Config{Limit: 10, Window: time.Minute, MaxBuckets: 10, IdleTTL: time.Minute}, time.Now)
@@ -164,17 +261,17 @@ func TestHTTPAllowsOnlyOneAIRequestInFlightPerUser(t *testing.T) {
 	r := router.New()
 	r.Register(router.V1, attemptshttp.New(game).Routes())
 	handler := middleware.RequestID()(r)
-	start := func() *httptest.ResponseRecorder {
+	start := func(userID int) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/training/free-play/start?role=buyer", nil)
-		request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: 1}))
+		request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: userID}))
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, request)
 		return rec
 	}
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() { firstDone <- start() }()
+	go func() { firstDone <- start(1) }()
 	<-provider.started
-	second := start()
+	second := start(2)
 	if second.Code != http.StatusTooManyRequests || !strings.Contains(second.Body.String(), `"code":"RATE_LIMITED"`) {
 		t.Fatalf("concurrent=(%d,%s)", second.Code, second.Body.String())
 	}
@@ -293,199 +390,3 @@ func TestHTTPFreePlayCompletesAtFiveAnswersWithoutLeakingAIState(t *testing.T) {
 		t.Fatalf("sixth=(%d,%s), answers=%d", sixthRecorder.Code, sixthRecorder.Body.String(), len(store.answers))
 	}
 }
-
-type contractAI struct{}
-
-func (contractAI) Evaluate(context.Context, attemptsservice.EvaluationRequest) (attemptsservice.EvaluatorResult, error) {
-	return contractEvaluation(), nil
-}
-func (contractAI) GenerateReply(_ context.Context, input attemptsservice.GenerationRequest) (attemptsservice.GeneratorResult, error) {
-	return contractGeneration(input), nil
-}
-
-type countingContractAI struct{ calls int }
-
-func (a *countingContractAI) Evaluate(context.Context, attemptsservice.EvaluationRequest) (attemptsservice.EvaluatorResult, error) {
-	a.calls++
-	return contractEvaluation(), nil
-}
-func (a *countingContractAI) GenerateReply(_ context.Context, input attemptsservice.GenerationRequest) (attemptsservice.GeneratorResult, error) {
-	a.calls++
-	return contractGeneration(input), nil
-}
-
-type blockingContractAI struct {
-	started chan struct{}
-	release chan struct{}
-	calls   atomic.Int32
-}
-
-func (a *blockingContractAI) Evaluate(context.Context, attemptsservice.EvaluationRequest) (attemptsservice.EvaluatorResult, error) {
-	if a.calls.Add(1) == 1 {
-		close(a.started)
-	}
-	<-a.release
-	return contractEvaluation(), nil
-}
-func (a *blockingContractAI) GenerateReply(_ context.Context, input attemptsservice.GenerationRequest) (attemptsservice.GeneratorResult, error) {
-	if a.calls.Add(1) == 1 {
-		close(a.started)
-	}
-	<-a.release
-	return contractGeneration(input), nil
-}
-
-type failingContractAI struct{}
-
-func (failingContractAI) Evaluate(context.Context, attemptsservice.EvaluationRequest) (attemptsservice.EvaluatorResult, error) {
-	return attemptsservice.EvaluatorResult{}, attemptsservice.ErrAIUnavailable
-}
-func (failingContractAI) GenerateReply(context.Context, attemptsservice.GenerationRequest) (attemptsservice.GeneratorResult, error) {
-	return attemptsservice.GeneratorResult{}, attemptsservice.ErrAIUnavailable
-}
-
-type invalidContractAI struct{}
-
-func (invalidContractAI) Evaluate(context.Context, attemptsservice.EvaluationRequest) (attemptsservice.EvaluatorResult, error) {
-	return attemptsservice.EvaluatorResult{}, attemptsservice.ErrAIInvalidResponse
-}
-func (invalidContractAI) GenerateReply(context.Context, attemptsservice.GenerationRequest) (attemptsservice.GeneratorResult, error) {
-	return attemptsservice.GeneratorResult{}, attemptsservice.ErrAIInvalidResponse
-}
-
-type sequenceContractAI struct{ calls int }
-
-func (a *sequenceContractAI) Evaluate(context.Context, attemptsservice.EvaluationRequest) (attemptsservice.EvaluatorResult, error) {
-	a.calls++
-	if a.calls > 1 {
-		return attemptsservice.EvaluatorResult{}, attemptsservice.ErrAIUnavailable
-	}
-	return contractEvaluation(), nil
-}
-func (a *sequenceContractAI) GenerateReply(_ context.Context, input attemptsservice.GenerationRequest) (attemptsservice.GeneratorResult, error) {
-	a.calls++
-	if a.calls > 1 {
-		return attemptsservice.GeneratorResult{}, attemptsservice.ErrAIUnavailable
-	}
-	return contractGeneration(input), nil
-}
-
-func contractEvaluation() attemptsservice.EvaluatorResult {
-	return attemptsservice.EvaluatorResult{Score: 4, RiskType: "social_engineering", Evaluation: "безопасно", SafeAction: "остаться в сервисе"}
-}
-
-func contractGeneration(input attemptsservice.GenerationRequest) attemptsservice.GeneratorResult {
-	return attemptsservice.GeneratorResult{Message: "продолжим", Tactic: input.AllowedTactics[0], Phase: input.Phase}
-}
-
-type httpGameStore struct {
-	attempts map[int]domain.Attempt
-	answers  []domain.UserAnswer
-	messages []domain.DialogueMessage
-}
-
-func newHTTPGameStore() *httpGameStore { return &httpGameStore{attempts: map[int]domain.Attempt{}} }
-func (s *httpGameStore) Levels(int, string) ([]domain.Level, []domain.Progress, error) {
-	return []domain.Level{{ID: 1, Number: 1}, {ID: 2, Number: 2}, {ID: 3, Number: 3}, {ID: 4, Number: 4}}, []domain.Progress{{LevelID: 1, Stars: 1}, {LevelID: 2, Stars: 1}, {LevelID: 4, Stars: 1}}, nil
-}
-func (s *httpGameStore) PublishedScenario(level int, role string) (domain.Scenario, error) {
-	if level != 3 {
-		return domain.Scenario{}, errors.New("missing")
-	}
-	return domain.Scenario{ID: 3, LevelID: 3, UserRole: role}, nil
-}
-func (s *httpGameStore) FreePlayConfig(role string) (domain.FreePlayConfig, error) {
-	return domain.FreePlayConfig{UserRole: role}, nil
-}
-func (s *httpGameStore) Scenario(int) (domain.Scenario, error) {
-	return domain.Scenario{ID: 3, LevelID: 3, UserRole: "buyer"}, nil
-}
-func (s *httpGameStore) FindInProgress(userID, scenarioID int) (domain.Attempt, error) {
-	for _, attempt := range s.attempts {
-		if attempt.UserID == userID && attempt.ScenarioID == scenarioID {
-			return attempt, nil
-		}
-	}
-	return domain.Attempt{}, errors.New("missing")
-}
-func (s *httpGameStore) FindInProgressFreePlay(int, string) (domain.Attempt, error) {
-	return domain.Attempt{}, errors.New("missing")
-}
-func (s *httpGameStore) CreateGameAttempt(attempt domain.Attempt) (domain.Attempt, error) {
-	attempt.ID = 1
-	s.attempts[1] = attempt
-	return attempt, nil
-}
-func (s *httpGameStore) StartFreePlay(attempt domain.Attempt, message domain.DialogueMessage) (domain.Attempt, error) {
-	created, err := s.CreateGameAttempt(attempt)
-	if err != nil {
-		return domain.Attempt{}, err
-	}
-	message.AttemptID = created.ID
-	s.messages = append(s.messages, message)
-	return created, nil
-}
-func (s *httpGameStore) GetGameAttempt(id int) (domain.Attempt, error) {
-	a, ok := s.attempts[id]
-	if !ok {
-		return domain.Attempt{}, errors.New("missing")
-	}
-	return a, nil
-}
-func (s *httpGameStore) Step(_ int, number int) (domain.ScenarioStep, error) {
-	if number != 1 {
-		return domain.ScenarioStep{}, errors.New("missing")
-	}
-	return domain.ScenarioStep{ID: 31, ScenarioID: 3, Number: 1, ResponseType: "mixed", FallbackMessage: "Начальная реплика", Options: []domain.ScenarioOption{{ID: 11, Points: 100}}}, nil
-}
-func (s *httpGameStore) Answers(int) ([]domain.UserAnswer, error) {
-	return append([]domain.UserAnswer(nil), s.answers...), nil
-}
-func (s *httpGameStore) Messages(int) ([]domain.DialogueMessage, error) {
-	return append([]domain.DialogueMessage(nil), s.messages...), nil
-}
-func (s *httpGameStore) AwardedPoints(int) (int, error) {
-	total := 0
-	for _, a := range s.answers {
-		total += a.AwardedPoints
-	}
-	return total, nil
-}
-func (s *httpGameStore) Advance(id, next int) error {
-	a := s.attempts[id]
-	a.CurrentStepNumber = next
-	s.attempts[id] = a
-	return nil
-}
-func (s *httpGameStore) Abandon(id int, _ time.Time) error {
-	a := s.attempts[id]
-	a.Status = domain.AttemptStatusAbandoned
-	s.attempts[id] = a
-	return nil
-}
-func (s *httpGameStore) Complete(action func(attemptsservice.GameCompletionStore) error) error {
-	return action(s)
-}
-func (s *httpGameStore) SaveAnswer(answer domain.UserAnswer) error {
-	s.answers = append(s.answers, answer)
-	return nil
-}
-func (s *httpGameStore) SaveMessage(message domain.DialogueMessage) error {
-	s.messages = append(s.messages, message)
-	return nil
-}
-func (s *httpGameStore) AdvanceAttempt(id, next int) error { return s.Advance(id, next) }
-func (s *httpGameStore) UpdateDialogueState(id, count int, phase, summary string) error {
-	a := s.attempts[id]
-	a.FreeTextCount = count
-	a.DialoguePhase = phase
-	a.CompactSummary = summary
-	s.attempts[id] = a
-	return nil
-}
-func (s *httpGameStore) CompleteAttempt(attempt domain.Attempt) error {
-	s.attempts[attempt.ID] = attempt
-	return nil
-}
-func (s *httpGameStore) SaveProgress(domain.Progress) error           { return nil }
-func (s *httpGameStore) FinalizeLearning(*domain.AttemptResult) error { return nil }

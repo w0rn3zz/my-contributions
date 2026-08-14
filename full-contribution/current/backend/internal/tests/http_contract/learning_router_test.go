@@ -171,109 +171,49 @@ func TestHTTPDashboardOffersFreePlayOnlyAfterAllSixTopicsAreCompleted(t *testing
 	}
 }
 
-type learningStore struct {
-	theoryRead    bool
-	activityCalls int
-	attemptID     int
-	lastRole      domain.UserRole
-	daily         map[string]domain.DailyTask
-	topics        []domain.Topic
-}
-
-type stableLearningStore struct {
-	*learningStore
-	recommendations map[string]domain.ContinueAction
-}
-
-func (s *stableLearningStore) FindRecommendation(_ int, date time.Time, role domain.UserRole) (domain.ContinueAction, bool, error) {
-	action, ok := s.recommendations[date.Format("2006-01-02")+":"+string(role)]
-	return action, ok, nil
-}
-
-func (s *stableLearningStore) SaveRecommendation(_ int, date time.Time, role domain.UserRole, action domain.ContinueAction) error {
-	s.recommendations[date.Format("2006-01-02")+":"+string(role)] = action
-	return nil
-}
-
-func (s *learningStore) FindDailyTask(_ int, date time.Time) (domain.DailyTask, bool, error) {
-	task, ok := s.daily[date.Format("2006-01-02")]
-	return task, ok, nil
-}
-
-func (s *learningStore) DailyTask(_ int, date time.Time, created domain.DailyTask) (domain.DailyTask, error) {
-	if s.daily == nil {
-		s.daily = map[string]domain.DailyTask{}
+func TestHTTPSkillCheckPersistsPairAndNeverTouchesProgression(t *testing.T) {
+	store := &learningStore{}
+	handler := router.New()
+	handler.Register(router.V1, learninghttp.New(learningservice.New(store)).Routes())
+	call := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: 7}))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
 	}
-	key := date.Format("2006-01-02")
-	if task, ok := s.daily[key]; ok {
-		return task, nil
+	beforeTheory, beforeActivity := store.theoryRead, store.activityCalls
+	start := call(http.MethodPost, "/api/v1/topics/1/skill-check/start", "")
+	if start.Code != http.StatusOK || !strings.Contains(start.Body.String(), `"phase":"before"`) || !strings.Contains(start.Body.String(), `"snapshot"`) {
+		t.Fatalf("start = (%d,%s)", start.Code, start.Body.String())
 	}
-	task := created
-	s.daily[key] = task
-	return task, nil
-}
-func (s *learningStore) AnswerDailyTask(_ int, date time.Time, answer bool) (domain.DailyTask, domain.Streak, error) {
-	key := date.Format("2006-01-02")
-	task, ok := s.daily[key]
-	if !ok {
-		return domain.DailyTask{}, domain.Streak{}, learningservice.ErrDailyTaskUnavailable
+	pre := call(http.MethodPost, "/api/v1/skill-checks/9/answers", `{"answer":false}`)
+	if pre.Code != http.StatusOK || !strings.Contains(pre.Body.String(), `"phase":"after_locked"`) || strings.Contains(pre.Body.String(), `"snapshot"`) {
+		t.Fatalf("pre = (%d,%s)", pre.Code, pre.Body.String())
 	}
-	if task.Completed {
-		return domain.DailyTask{}, domain.Streak{}, learningservice.ErrDailyTaskAnswered
+	store.skillCheck.TopicComplete = true
+	resume := call(http.MethodPost, "/api/v1/topics/1/skill-check/start", "")
+	if resume.Code != http.StatusOK || !strings.Contains(resume.Body.String(), `"phase":"after"`) || !strings.Contains(resume.Body.String(), "Отправьте код возврата") {
+		t.Fatalf("resume = (%d,%s)", resume.Code, resume.Body.String())
 	}
-	correct := answer == task.Verdict
-	task.Answer, task.Correct, task.Completed = &answer, &correct, true
-	now := time.Now()
-	task.CompletedAt = &now
-	s.daily[key] = task
-	return task, domain.Streak{Current: 1, Longest: 1, ActiveToday: true}, nil
-}
-
-func (s *learningStore) Topics(_ int, role domain.UserRole) ([]domain.Topic, error) {
-	s.lastRole = role
-	if s.topics != nil {
-		return s.topics, nil
+	post := call(http.MethodPost, "/api/v1/skill-checks/9/answers", `{"answer":true}`)
+	if post.Code != http.StatusOK || !strings.Contains(post.Body.String(), `"phase":"completed"`) || !strings.Contains(post.Body.String(), `"verdict_improved":true`) || !strings.Contains(post.Body.String(), `"pattern_improved":true`) || !strings.Contains(post.Body.String(), `"improved":true`) {
+		t.Fatalf("post = (%d,%s)", post.Code, post.Body.String())
 	}
-	return []domain.Topic{{ID: 1, Slug: string(role) + "-topic", UserRole: role, Title: "Тема", Description: "Описание", SortOrder: 1, TheoryRead: s.theoryRead, Levels: []domain.TopicLevelProgress{{Number: 1, Opened: true}, {Number: 2}, {Number: 3}, {Number: 4}}}}, nil
-}
-
-func (s *learningStore) Topic(_ int, topicID int) (domain.Topic, error) {
-	return domain.Topic{ID: topicID, UserRole: domain.UserRoleBuyer, TheoryRead: s.theoryRead}, nil
-}
-
-func (s *learningStore) Theory(topicID int) ([]domain.TheoryBlock, error) {
-	return []domain.TheoryBlock{{ID: 1, TopicID: topicID, SortOrder: 1, Kind: "intro", Title: "Введение", Body: "Текст"}}, nil
-}
-
-func (s *learningStore) MarkTheoryRead(_ int, _ int, _ time.Time) (domain.Streak, bool, error) {
-	s.activityCalls++
-	newlyRead := !s.theoryRead
-	s.theoryRead = true
-	return domain.Streak{Current: 1, Longest: 1, ActiveToday: true, LastActivityDate: "2026-08-09"}, newlyRead, nil
-}
-
-func (s *learningStore) Quiz(int) ([]domain.QuizQuestion, error) {
-	questions := make([]domain.QuizQuestion, 5)
-	for i := range questions {
-		questions[i] = domain.QuizQuestion{ID: i + 1, SortOrder: i + 1, Text: "Вопрос", Explanation: "Скрыто", Options: []domain.QuizOption{{ID: i*10 + 1, Text: "Вариант", Correct: true}, {ID: i*10 + 2, Text: "Вариант"}, {ID: i*10 + 3, Text: "Вариант"}, {ID: i*10 + 4, Text: "Вариант"}}}
+	if store.theoryRead != beforeTheory || store.activityCalls != beforeActivity {
+		t.Fatalf("skill check changed progression: theory=%v activity=%d", store.theoryRead, store.activityCalls)
 	}
-	return questions, nil
 }
 
-func (s *learningStore) SubmitQuiz(_ int, _ int, _ []domain.QuizAnswer, _ time.Time) (domain.QuizResult, error) {
-	return domain.QuizResult{Score: 80, Passed: true, BestScore: 80, NewlyPassed: true, Streak: domain.Streak{Current: 1, Longest: 1, ActiveToday: true}}, nil
-}
-func (s *learningStore) RecentAttempts(int, domain.UserRole) ([]domain.RecentAttempt, float64, error) {
-	return []domain.RecentAttempt{}, 0, nil
-}
-
-func (s *learningStore) Achievements(int) ([]domain.Achievement, error) {
-	return []domain.Achievement{}, nil
-}
-func (s *learningStore) User(int) (domain.User, error) {
-	return domain.User{ID: 7, Username: "alex", TrainingRole: domain.UserRoleBuyer}, nil
-}
-func (s *learningStore) InProgressAttempt(_ int, role domain.UserRole) (int, int, int, error) {
-	s.lastRole = role
-	return s.attemptID, 1, 2, nil
+func TestHTTPPersonalRecommendationUsesStablePatternWithoutUnlockingLevel(t *testing.T) {
+	store := &learningStore{stablePattern: "external_link", topics: []domain.Topic{{ID: 1, Slug: "buyer-phishing-links", UserRole: domain.UserRoleBuyer, Status: domain.TopicStatusPublished, TheoryRead: true, QuizPassed: true, Levels: []domain.TopicLevelProgress{{Number: 1, Opened: true, Stars: 1}, {Number: 2, Opened: true}, {Number: 3, Opened: false}, {Number: 4, Opened: false}}}}}
+	handler := router.New()
+	handler.Register(router.V1, learninghttp.New(learningservice.New(store)).Routes())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/recommendations/next?role=buyer", nil)
+	request = request.WithContext(authservice.WithIdentity(request.Context(), authservice.Identity{UserID: 7}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"type":"start_level"`) || !strings.Contains(recorder.Body.String(), `"level":2`) || strings.Contains(recorder.Body.String(), `"level":3`) {
+		t.Fatalf("recommendation = (%d,%s)", recorder.Code, recorder.Body.String())
+	}
 }

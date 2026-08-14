@@ -31,6 +31,8 @@ func NewGameWithRateLimits(repository GameRepository, evaluator Evaluator, gener
 
 type RateLimitError struct{ RetryAfter time.Duration }
 
+var ErrFreePlayLocked = apperrors.ErrForbidden
+
 func (e *RateLimitError) Error() string { return fmt.Sprintf("rate limited for %s", e.RetryAfter) }
 func (s *GameService) beforeAI(userID int, freePlay bool) (func(), error) {
 	key := fmt.Sprintf("user:%d", userID)
@@ -41,7 +43,10 @@ func (s *GameService) beforeAI(userID int, freePlay bool) (func(), error) {
 	release := func() {}
 	if s.aiGate != nil {
 		var ok bool
-		release, ok = s.aiGate.TryEnter(key)
+		// The local provider is a single shared capacity boundary. The queue is
+		// deliberately bounded at zero: overload is rejected immediately and
+		// clients retry instead of accumulating requests in process memory.
+		release, ok = s.aiGate.TryEnter("local-ai-provider")
 		if !ok {
 			return nil, &RateLimitError{RetryAfter: time.Second}
 		}
@@ -62,6 +67,13 @@ func NewGameWithAI(repository GameRepository, evaluator Evaluator, generator Sca
 
 func NewGameWithDependencies(repository GameRepository, evaluator Evaluator, generator ScammerGenerator, selectScam func() bool) *GameService {
 	return &GameService{repository: repository, evaluator: evaluator, generator: generator, selectScam: selectScam}
+}
+
+func (s *GameService) AIMetrics() AIMetricsSnapshot {
+	if observable, ok := s.evaluator.(interface{ Metrics() AIMetricsSnapshot }); ok {
+		return observable.Metrics()
+	}
+	return AIMetricsSnapshot{}
 }
 
 func randomScam() bool {
@@ -132,7 +144,10 @@ func (s *GameService) completionError(attempt domain.Attempt, err error) error {
 	return err
 }
 
-func (s *GameService) Levels(userID int, role string, topicID ...int) ([]OpenLevel, error) {
+func (s *GameService) Levels(userID int, role domain.UserRole, topicID ...int) ([]OpenLevel, error) {
+	if !domain.ValidUserRole(role) {
+		return nil, apperrors.ErrForbidden
+	}
 	levels, progress, err := s.repository.Levels(userID, role)
 	quizPassed := true
 	if len(topicID) > 0 {
@@ -234,7 +249,26 @@ func (s *GameService) Result(userID, attemptID int) (domain.AttemptResult, error
 	return topical.Result(attemptID)
 }
 
-func (s *GameService) Start(userID, levelNumber int, role string, topicID ...int) (GameState, error) {
+type MicroQuestionAnswer struct {
+	Correct    bool
+	SafeAction string
+}
+
+func (s *GameService) AnswerMicroQuestion(userID, attemptID, answerIndex int) (MicroQuestionAnswer, error) {
+	result, err := s.Result(userID, attemptID)
+	if err != nil {
+		return MicroQuestionAnswer{}, err
+	}
+	if result.MicroQuestion == nil || answerIndex < 0 || answerIndex >= len(result.MicroQuestion.Options) {
+		return MicroQuestionAnswer{}, apperrors.ErrInvalidAnswer
+	}
+	return MicroQuestionAnswer{Correct: answerIndex == result.MicroQuestion.Correct, SafeAction: result.Feedback.SafeAlternative}, nil
+}
+
+func (s *GameService) Start(userID, levelNumber int, role domain.UserRole, topicID ...int) (GameState, error) {
+	if !domain.ValidUserRole(role) {
+		return GameState{}, apperrors.ErrForbidden
+	}
 	levels, err := s.Levels(userID, role, topicID...)
 	if err != nil {
 		return GameState{}, err
@@ -299,7 +333,17 @@ func (s *GameService) Start(userID, levelNumber int, role string, topicID ...int
 	return state, nil
 }
 
-func (s *GameService) StartFreePlay(ctx context.Context, userID int, role string) (GameState, error) {
+func (s *GameService) StartFreePlay(ctx context.Context, userID int, role domain.UserRole) (GameState, error) {
+	if !domain.ValidUserRole(role) {
+		return GameState{}, apperrors.ErrForbidden
+	}
+	unlocked, err := s.repository.FreePlayUnlocked(userID, role)
+	if err != nil {
+		return GameState{}, err
+	}
+	if !unlocked {
+		return GameState{}, ErrFreePlayLocked
+	}
 	if attempt, findErr := s.repository.FindInProgressFreePlay(userID, role); findErr == nil {
 		config, configErr := s.repository.FreePlayConfig(role)
 		if configErr != nil {
@@ -334,7 +378,7 @@ func (s *GameService) StartFreePlay(ctx context.Context, userID int, role string
 		return GameState{}, limitErr
 	}
 	defer release()
-	initial, err := s.generateReply(ctx, attempt, freePlayScenario, domain.ScenarioStep{}, nil, "Начни разговор о сделке одной короткой репликой", "hook", "")
+	initial, err := s.generateReply(ctx, attempt, freePlayScenario, domain.ScenarioStep{}, nil, "hook", "")
 	if err != nil {
 		return GameState{}, err
 	}
@@ -452,7 +496,7 @@ func (s *GameService) submitFreeText(ctx context.Context, userID, attemptID int,
 	replyText := step.FallbackMessage
 	if usesGeneratedDialogue(attempt, scenario) {
 		phase := phaseForTurn(count)
-		generated, generateErr := s.generateReply(ctx, attempt, scenario, step, messages, text, phase, attempt.CompactSummary)
+		generated, generateErr := s.generateReply(ctx, attempt, scenario, step, messages, phase, attempt.CompactSummary)
 		if generateErr != nil {
 			return GameState{}, nil, generateErr
 		}
@@ -544,10 +588,10 @@ func (s *GameService) evaluateAnswer(ctx context.Context, attempt domain.Attempt
 	if attempt.Mode == domain.AttemptModeFreePlay && attempt.IsScam != nil && !*attempt.IsScam {
 		riskType = "ordinary_transaction"
 	}
-	return s.evaluator.Evaluate(ctx, EvaluationRequest{Policy: PolicyFor(attempt.UserRole, riskType), RiskType: riskType, ScenarioInstruction: scenario.AISystemPrompt, Rubric: scenario.FinalRubric, EvaluationContext: step.AIInstruction, Answer: text, History: tailMessages(history, 2)})
+	return s.evaluator.Evaluate(ctx, EvaluationRequest{Policy: PolicyFor(string(attempt.UserRole), riskType), RiskType: riskType, ScenarioInstruction: scenario.AISystemPrompt, Rubric: scenario.FinalRubric, EvaluationContext: step.AIInstruction, Answer: text, History: tailMessages(history, 2)})
 }
 
-func (s *GameService) generateReply(ctx context.Context, attempt domain.Attempt, scenario domain.Scenario, step domain.ScenarioStep, history []domain.DialogueMessage, text, phase, summary string) (GeneratorResult, error) {
+func (s *GameService) generateReply(ctx context.Context, attempt domain.Attempt, scenario domain.Scenario, step domain.ScenarioStep, history []domain.DialogueMessage, phase, summary string) (GeneratorResult, error) {
 	riskType := string(scenario.RiskType)
 	if !domain.ValidRiskType(scenario.RiskType) {
 		riskType = primaryRisk(scenario.ScamScheme)
@@ -561,7 +605,7 @@ func (s *GameService) generateReply(ctx context.Context, attempt domain.Attempt,
 		tactics = honestTacticsForPhase(phase)
 		riskType = "ordinary_transaction"
 	}
-	return s.generator.GenerateReply(ctx, GenerationRequest{UserRole: attempt.UserRole, Policy: PolicyFor(attempt.UserRole, riskType), RiskType: riskType, ScenarioInstruction: scenario.AISystemPrompt, Rubric: scenario.FinalRubric, Phase: phase, AllowedTactics: tactics, ScenarioFacts: scenario.ProductContext, Summary: summary, History: tailMessages(history, 6), Answer: text, Fallback: step.FallbackMessage, CounterpartKind: kind})
+	return s.generator.GenerateReply(ctx, GenerationRequest{UserRole: string(attempt.UserRole), Policy: PolicyFor(string(attempt.UserRole), riskType), RiskType: riskType, ScenarioInstruction: scenario.AISystemPrompt, Rubric: scenario.FinalRubric, Phase: phase, AllowedTactics: tactics, ScenarioFacts: scenario.ProductContext, Summary: summary, History: tailMessages(history, 6), Fallback: step.FallbackMessage, CounterpartKind: kind})
 }
 
 func primaryRisk(value string) string {
@@ -611,7 +655,7 @@ func freePlayScenario(config domain.FreePlayConfig, summary string) domain.Scena
 	return domain.Scenario{ProductContext: context, AISystemPrompt: config.SystemPrompt, FinalRubric: config.FinalRubric}
 }
 
-func (s *GameService) randomFreePlayContext(userID int, role string) (string, domain.ProductContext) {
+func (s *GameService) randomFreePlayContext(userID int, role domain.UserRole) (string, domain.ProductContext) {
 	contexts := freePlayContexts(role)
 	keys := make([]string, 0, len(contexts))
 	for key := range contexts {
@@ -625,7 +669,7 @@ func (s *GameService) randomFreePlayContext(userID int, role string) (string, do
 	if s.lastContext == nil {
 		s.lastContext = make(map[string]string)
 	}
-	playerKey := strconv.Itoa(userID) + ":" + role
+	playerKey := strconv.Itoa(userID) + ":" + string(role)
 	if len(keys) > 1 && key == s.lastContext[playerKey] {
 		for _, candidate := range keys {
 			if candidate != key {
@@ -638,8 +682,8 @@ func (s *GameService) randomFreePlayContext(userID int, role string) (string, do
 	return key, contexts[key]
 }
 
-func freePlayContexts(role string) map[string]domain.ProductContext {
-	if role == "seller" {
+func freePlayContexts(role domain.UserRole) map[string]domain.ProductContext {
+	if role == domain.UserRoleSeller {
 		return map[string]domain.ProductContext{
 			"phone":  {ItemTitle: "Смартфон Samsung Galaxy S24", Category: "Смартфоны", DealMethod: "delivery", Price: 59000, Currency: "RUB", Location: "Москва", ImageKey: "smartphone"},
 			"camera": {ItemTitle: "Фотоаппарат Sony Alpha", Category: "Фототехника", DealMethod: "delivery", Price: 48000, Currency: "RUB", Location: "Казань", ImageKey: "camera"},
@@ -693,7 +737,9 @@ func (s *GameService) completeFreeText(attempt domain.Attempt, scenario domain.S
 	}
 	allAnswers := append(append([]domain.UserAnswer{}, previousAnswers...), answer)
 	attempt.Score = domain.NormalizedScore(raw, len(allAnswers)*100)
-	attempt.Status = domain.AttemptStatusCompleted
+	if !attempt.TransitionTo(domain.AttemptStatusCompleted) {
+		return GameState{}, nil, apperrors.ErrInvalidAttemptStatusTransition
+	}
 	attempt.FinishedAt = time.Now().UTC()
 	attempt.FreeTextCount = count
 	breakdown := make([]AnswerBreakdown, 0, len(allAnswers))
@@ -758,7 +804,7 @@ func (s *GameService) completeFreeText(attempt domain.Attempt, scenario domain.S
 				return err
 			}
 		}
-		return store.FinalizeLearning(&result)
+		return s.finalizeLearningResult(store, attempt.UserID, scenario.UserRole, string(scenario.RiskType), &result)
 	}); err != nil {
 		return GameState{}, nil, s.completionError(attempt, err)
 	}
@@ -868,7 +914,9 @@ func (s *GameService) Submit(userID, attemptID, optionID int, expectedStepID ...
 		maximum += current.MaxPoints
 	}
 	attempt.Score = domain.NormalizedScore(raw, maximum)
-	attempt.Status = domain.AttemptStatusCompleted
+	if !attempt.TransitionTo(domain.AttemptStatusCompleted) {
+		return GameState{}, nil, apperrors.ErrInvalidAttemptStatusTransition
+	}
 	attempt.FinishedAt = time.Now().UTC()
 	scenario, scenarioErr := s.repository.Scenario(attempt.ScenarioID)
 	if scenarioErr != nil {
@@ -906,7 +954,7 @@ func (s *GameService) Submit(userID, attemptID, optionID int, expectedStepID ...
 			return err
 		}
 		result.DecisionReview = breakdownForAnswers(append(answers, answer), scenario)
-		return store.FinalizeLearning(&result)
+		return s.finalizeLearningResult(store, attempt.UserID, scenario.UserRole, string(scenario.RiskType), &result)
 	}); err != nil {
 		return GameState{}, nil, s.completionError(attempt, err)
 	}
@@ -924,6 +972,81 @@ func (s *GameService) Submit(userID, attemptID, optionID int, expectedStepID ...
 	breakdown[len(breakdown)-1].Points, breakdown[len(breakdown)-1].Explanation, breakdown[len(breakdown)-1].OptionText = option.Points, option.Explanation, option.Text
 	result.DecisionReview = breakdown
 	return GameState{}, &Completion{Attempt: attempt, Stars: stars, Answers: answers, Breakdown: breakdown, Result: result}, nil
+}
+
+func (s *GameService) finalizeLearningResult(store GameCompletionStore, userID int, role domain.UserRole, fallbackPattern string, result *domain.AttemptResult) error {
+	if err := store.FinalizeLearning(result); err != nil {
+		return err
+	}
+	events := mistakePatternEvents(result.DecisionReview, fallbackPattern)
+	if err := store.RecordMistakePatternEvents(userID, result.AttemptID, result.TopicID, role, events); err != nil {
+		return err
+	}
+	stats, err := store.MistakePatternStats(userID, role)
+	if err != nil {
+		return err
+	}
+	result.Feedback = feedbackFor(result.DecisionReview)
+	for _, item := range stats {
+		if item.Stable() {
+			result.MicroQuestion = domain.MicroQuestionFor(item.PatternCode)
+			break
+		}
+	}
+	return store.SaveResult(*result)
+}
+
+func mistakePatternEvents(items []domain.AnswerBreakdown, fallbackPattern string) []domain.MistakePatternEvent {
+	if strings.TrimSpace(fallbackPattern) == "" {
+		fallbackPattern = "social_engineering"
+	}
+	seen := make(map[domain.MistakePatternEvent]struct{})
+	for _, item := range items {
+		isSafe := item.Assessment == "safe" || item.Assessment == "mostly_safe"
+		if len(item.RiskSignals) == 0 {
+			seen[domain.MistakePatternEvent{PatternCode: fallbackPattern, IsSafe: isSafe}] = struct{}{}
+			continue
+		}
+		for _, signal := range item.RiskSignals {
+			if code := strings.TrimSpace(signal.Code); code != "" {
+				seen[domain.MistakePatternEvent{PatternCode: code, IsSafe: isSafe}] = struct{}{}
+			}
+		}
+	}
+	result := make([]domain.MistakePatternEvent, 0, len(seen))
+	for event := range seen {
+		result = append(result, event)
+	}
+	return result
+}
+
+func feedbackFor(items []domain.AnswerBreakdown) domain.ResultFeedback {
+	feedback := domain.ResultFeedback{Reason: "Выберите безопасное действие и проверяйте условия сделки самостоятельно.", RiskSignals: []domain.RiskSignal{}, SafeAlternative: "Продолжайте сделку только штатными способами внутри приложения."}
+	for _, item := range items {
+		if item.Assessment == "safe" {
+			continue
+		}
+		if item.Explanation != "" {
+			feedback.Reason = item.Explanation
+		}
+		if item.SafeAction != "" {
+			feedback.SafeAlternative = item.SafeAction
+		}
+		for _, signal := range item.RiskSignals {
+			if len(feedback.RiskSignals) == 2 {
+				break
+			}
+			duplicate := false
+			for _, existing := range feedback.RiskSignals {
+				duplicate = duplicate || existing.Code == signal.Code
+			}
+			if !duplicate {
+				feedback.RiskSignals = append(feedback.RiskSignals, signal)
+			}
+		}
+		return feedback
+	}
+	return feedback
 }
 
 func breakdownForAnswers(answers []domain.UserAnswer, scenario domain.Scenario) []domain.AnswerBreakdown {
@@ -1013,6 +1136,17 @@ func normalizeRiskSignals(values []string, riskType domain.RiskType) []domain.Ri
 	return result
 }
 
+// NormalizeRiskSignalCodes applies the same deterministic normalization used
+// when evaluator output is persisted in an Attempt Result.
+func NormalizeRiskSignalCodes(values []string, riskType domain.RiskType) []string {
+	signals := normalizeRiskSignals(values, riskType)
+	codes := make([]string, len(signals))
+	for i, signal := range signals {
+		codes[i] = signal.Code
+	}
+	return codes
+}
+
 func signalCodeForRisk(riskType domain.RiskType) string {
 	return map[domain.RiskType]string{
 		domain.RiskPhishing: "external_link", domain.RiskPrepayment: "prepayment", domain.RiskFakePayment: "fake_payment",
@@ -1027,6 +1161,9 @@ func (s *GameService) Abandon(userID, attemptID int) error {
 		return apperrors.ErrAttemptNotFound
 	}
 	if attempt.Status != domain.AttemptStatusInProgress {
+		return apperrors.ErrInvalidAttemptStatusTransition
+	}
+	if !attempt.TransitionTo(domain.AttemptStatusAbandoned) {
 		return apperrors.ErrInvalidAttemptStatusTransition
 	}
 	return s.repository.Abandon(attemptID, time.Now().UTC())

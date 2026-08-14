@@ -1,9 +1,30 @@
 # Полный индекс личных коммитов
 
-Ниже перечислены все 77 прямых non-merge коммитов автора `w0rn3zz <w0rn3zz@gmail.com>` в командном репозитории. Ссылки ведут на исходную историю.
+Ниже перечислены все прямые non-merge коммиты автора `w0rn3zz <w0rn3zz@gmail.com>` в командном репозитории. Ссылки ведут на исходную историю.
 
 | Дата | Коммит | Описание |
 | --- | --- | --- |
+| 2026-08-14 | [`aa46542`](https://github.com/Codiki-lab/anti-scam-trainer/commit/aa4654292df0f6ffa02900e24d79963a38b19ff3) | fix: stabilize dialogue evaluation and replies |
+| 2026-08-14 | [`e262476`](https://github.com/Codiki-lab/anti-scam-trainer/commit/e26247693eeec9a13c8fd879301f252213e1725f) | Evaluate generic disagreement by context |
+| 2026-08-14 | [`bfde469`](https://github.com/Codiki-lab/anti-scam-trainer/commit/bfde469a543c83c4fc7f7dada35cf3ba2694c395) | Evaluate polite bare refusals by context |
+| 2026-08-14 | [`260cf88`](https://github.com/Codiki-lab/anti-scam-trainer/commit/260cf8849c1d7a6f256d6907b47d73320991b7c0) | Evaluate bare refusals by context |
+| 2026-08-14 | [`a5c0182`](https://github.com/Codiki-lab/anti-scam-trainer/commit/a5c01821c36709e9625a716e4ea5c639ee581ad9) | Restrict fast path to exact safe refusals |
+| 2026-08-14 | [`daa2abb`](https://github.com/Codiki-lab/anti-scam-trainer/commit/daa2abb0931f148c351bab3314a6b2cc70cccecf) | Keep compound refusals on model evaluation |
+| 2026-08-14 | [`f9c4c5f`](https://github.com/Codiki-lab/anti-scam-trainer/commit/f9c4c5f579e004f1340be4f0236e6f9de571ff7c) | Award full points for unambiguous safe refusals |
+| 2026-08-14 | [`245e13a`](https://github.com/Codiki-lab/anti-scam-trainer/commit/245e13a5b05b95cdbc1d9e14c7d9404de2fe8a30) | Guard refusal fast path against semantic inversion |
+| 2026-08-14 | [`b7c2a12`](https://github.com/Codiki-lab/anti-scam-trainer/commit/b7c2a12d834b83dc7a703d15c9cb12716a80c917) | Broaden safe refusal recognition |
+| 2026-08-14 | [`5cae0d0`](https://github.com/Codiki-lab/anti-scam-trainer/commit/5cae0d0460db2ce44473f99af46ff8680ce0fe64) | Preserve scenario versions while polishing dialogue content |
+| 2026-08-14 | [`7713f48`](https://github.com/Codiki-lab/anti-scam-trainer/commit/7713f483536e5c84314401bff52ff70700f411a9) | Fix short answer evaluation and demo dialogue copy |
+| 2026-08-14 | [`42d5367`](https://github.com/Codiki-lab/anti-scam-trainer/commit/42d536738d13397bf794f429b23fe65115ba986b) | Fix login credentials payload |
+| 2026-08-13 | [`e580f04`](https://github.com/Codiki-lab/anti-scam-trainer/commit/e580f0436f69c7db9995bcaccf6c2e81fd6ab9ec) | fix: restore Avito chat topic recommendations |
+| 2026-08-13 | [`91a9c4d`](https://github.com/Codiki-lab/anti-scam-trainer/commit/91a9c4d2fc36c93aad9c528f0599274244ff0a00) | fix: retry Go module downloads in Docker builds |
+| 2026-08-13 | [`5fc9c33`](https://github.com/Codiki-lab/anti-scam-trainer/commit/5fc9c333dc33729dbee1ea644926b391859f3fcc) | feat: add adaptive learning feedback |
+| 2026-08-13 | [`b4d0036`](https://github.com/Codiki-lab/anti-scam-trainer/commit/b4d0036b65dce7d1eee51d9004a48b0c128d478d) | feat: recommend training topics from Avito chat risks |
+| 2026-08-13 | [`401496e`](https://github.com/Codiki-lab/anti-scam-trainer/commit/401496e1b1245fd665c99a7d1e8b8a4dda3ffc60) | ci: report total Go test coverage |
+| 2026-08-12 | [`62034be`](https://github.com/Codiki-lab/anti-scam-trainer/commit/62034be14b51b307adbbb5c42d29bb9e58055bc8) | fix: enforce domain invariants |
+| 2026-08-12 | [`795d3e9`](https://github.com/Codiki-lab/anti-scam-trainer/commit/795d3e999b5da483be7d2431e26415504235cbd5) | refactor: split application composition root |
+| 2026-08-12 | [`61d1204`](https://github.com/Codiki-lab/anti-scam-trainer/commit/61d1204ddf7047cd703b481a03c7cb8be395be77) | refactor: centralize backend tests |
+| 2026-08-12 | [`7d3f0eb`](https://github.com/Codiki-lab/anti-scam-trainer/commit/7d3f0eb70f44bb8a0a2c8e39ab5fa1aaff5be0de) | refactor: split AI provider files |
 | 2026-08-12 | [`047db3c`](https://github.com/Codiki-lab/anti-scam-trainer/commit/047db3cda00c5bb9198bfcedbfaceedd1bc8b6b9) | test: synchronize Ollama timeout assertion |
 | 2026-08-12 | [`310505d`](https://github.com/Codiki-lab/anti-scam-trainer/commit/310505d8ed5ddf51f873f7be464fcf138c2fe480) | style: format frontend widgets |
 | 2026-08-12 | [`cd8fa49`](https://github.com/Codiki-lab/anti-scam-trainer/commit/cd8fa4944d016506757e270d878d818b610191dd) | ci: fix local lint checks |
